@@ -43,6 +43,22 @@ static void fail(door_fsm_t *f, door_fault_t why, uint32_t now_ms)
     }
 }
 
+/* Resistance on every try and back at the anchor: the door stays there, in
+ * the resting state of that position (the state it had before the move). */
+static void settle_at_anchor(door_fsm_t *f, const door_fsm_config_t *c, uint32_t now_ms)
+{
+    door_state_t rest = DOOR_STATE_IDLE;
+    if (iabs32(f->move_origin) <= c->tolerance) {
+        rest = DOOR_STATE_CLOSED;
+    } else if (iabs32(f->move_origin - c->open_pos) <= c->tolerance) {
+        rest = DOOR_STATE_OPEN;
+    }
+    f->fault   = DOOR_FAULT_OBSTRUCTED;
+    f->changed = true;
+    enter(f, rest, now_ms);
+    finish(f, DOOR_RESULT_RETURNED);
+}
+
 /* Direction state for travelling from `from` to `target`. */
 static door_state_t leg_state(int32_t target, int32_t from)
 {
@@ -159,14 +175,10 @@ static void handle_command(door_fsm_t *f, const door_fsm_config_t *c,
         if (already_there || already_going) {
             break;
         }
-        /* Anchor = the nominal position of the resting state we leave,
-         * so repeated retries never drift. */
-        int32_t anchor = pos;
-        if (f->state == DOOR_STATE_OPEN) {
-            anchor = c->open_pos;
-        } else if (f->state == DOOR_STATE_CLOSED) {
-            anchor = 0;
-        }
+        /* Anchor = the other end: resistance while opening goes back to
+         * closed, while closing back to open (also when the move started
+         * half way, e.g. a close that interrupted an open). */
+        int32_t anchor = (cmd->type == DOOR_CMD_OPEN) ? 0 : c->open_pos;
         f->mv_rpm        = 0.0f;               /* use the speed profile */
         f->mv_return_rpm = 0.0f;
         f->mv_retries    = c->max_retries;
@@ -202,7 +214,8 @@ static void handle_command(door_fsm_t *f, const door_fsm_config_t *c,
             finish(f, DOOR_RESULT_DONE);
             break;
         }
-        start_move(f, goal, target, pos, now_ms, pos);   /* anchor = here */
+        start_move(f, goal, target, cmd->has_anchor ? cmd->anchor : pos,  /* default: here */
+                   now_ms, pos);
         break;
     }
 
@@ -250,9 +263,9 @@ door_fsm_output_t door_fsm_step(door_fsm_t *f, const door_fsm_config_t *c,
 
         if (iabs32(remaining) <= c->tolerance) {
             if (f->state == DOOR_STATE_BACKING_OFF) {
-                /* Back at the anchor: wait and retry, or give up here. */
+                /* Back at the anchor: wait and retry, or stay here. */
                 if (f->retries >= f->mv_retries) {
-                    fail(f, DOOR_FAULT_OBSTRUCTED, now_ms);
+                    settle_at_anchor(f, c, now_ms);
                 } else {
                     enter(f, DOOR_STATE_RETRY_WAIT, now_ms);
                 }
@@ -359,6 +372,7 @@ const char *door_fault_name(door_fault_t f)
     case DOOR_FAULT_BLOCKED:    return "blocked";
     case DOOR_FAULT_TIMEOUT:    return "timeout";
     case DOOR_FAULT_HOMING:     return "homing_failed";
+    case DOOR_FAULT_NOT_CLOSED: return "not_closed";
     default:                    return "?";
     }
 }
@@ -373,6 +387,7 @@ const char *door_result_name(door_result_t r)
     case DOOR_RESULT_STOPPED:     return "stopped";
     case DOOR_RESULT_TIMEOUT:     return "timeout";
     case DOOR_RESULT_SENSOR_FAIL: return "sensor_fail";
+    case DOOR_RESULT_NOT_CLOSED:  return "not_closed";
     default:                      return "?";
     }
 }

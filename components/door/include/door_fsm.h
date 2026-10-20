@@ -16,11 +16,15 @@
  *                  go TO an absolute position), at a chosen speed, with its
  *                  own retry settings
  *
- * Every move remembers where it started (its ANCHOR). Resistance handling:
+ * Every move has an ANCHOR: the state the door goes back to on resistance
+ * (someone holding the door, a package in the way). OPEN goes back to
+ * closed, CLOSE goes back to open; a MOVE goes back to where it started, or
+ * to `cmd.anchor` if `cmd.has_anchor`. Resistance handling:
  *
  *   moving --resistance--> BACKING_OFF (back to the anchor, by counts)
  *            --at anchor--> RETRY_WAIT --wait--> moving again (same target)
- *   after `max_retries` failed retries: stays at the anchor -> RETURNED
+ *   no retries left (max_retries = 0: at once): stays at the anchor in its
+ *       resting state (CLOSED / OPEN / IDLE), fault OBSTRUCTED -> RETURNED
  *   resistance while backing off too:   stops where it is  -> BLOCKED
  */
 #pragma once
@@ -47,21 +51,24 @@ typedef enum {
 
 typedef enum {
     DOOR_FAULT_NONE = 0,
-    DOOR_FAULT_OBSTRUCTED,   /* resistance on every try                        */
+    DOOR_FAULT_OBSTRUCTED,   /* resistance on every try: went back to the anchor */
     DOOR_FAULT_BLOCKED,      /* resistance while backing off (stuck both ways) */
     DOOR_FAULT_TIMEOUT,      /* a move took longer than its timeout            */
     DOOR_FAULT_HOMING,       /* homing never found the end stop                */
+    DOOR_FAULT_NOT_CLOSED,   /* closed all the way, but the door switch stayed open */
 } door_fault_t;
 
 /* How a move ended. BUSY while it is still running. */
 typedef enum {
     DOOR_RESULT_BUSY = 0,
     DOOR_RESULT_DONE,        /* reached the target                             */
-    DOOR_RESULT_RETURNED,    /* resistance every try: back at the anchor       */
+    DOOR_RESULT_RETURNED,    /* resistance every try: back at the anchor
+                              * (the previous state), fault OBSTRUCTED        */
     DOOR_RESULT_BLOCKED,     /* resistance on the way back too: stopped there  */
     DOOR_RESULT_STOPPED,     /* stopped by a stop command                      */
     DOOR_RESULT_TIMEOUT,     /* took too long                                  */
     DOOR_RESULT_SENSOR_FAIL, /* the current sensor stopped answering           */
+    DOOR_RESULT_NOT_CLOSED,  /* closing ended, but the door switch never closed */
 } door_result_t;
 
 typedef enum {
@@ -84,6 +91,8 @@ typedef struct {
     uint8_t    max_retries;    /* MOVE: retries after resistance                */
     uint32_t   retry_wait_ms;  /* MOVE: wait at the anchor before retrying      */
     uint32_t   timeout_ms;     /* MOVE: per attempt, 0 = config move_timeout_ms */
+    bool       has_anchor;     /* MOVE: on resistance go back to `anchor`...    */
+    int32_t    anchor;         /*       ...instead of where the move started    */
 } door_fsm_cmd_t;
 
 typedef struct {

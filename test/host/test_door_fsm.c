@@ -195,14 +195,15 @@ static void test_interference_then_success(void)
     CHECK(s.reversals_without_brake == 0);
 }
 
-static void test_persistent_interference_faults(void)
+static void test_persistent_interference_goes_back_closed(void)
 {
     sim_t s; sim_init(&s);
     s.block_dir = +1; s.block_pos = OPEN_POS / 2;
     sim_tick(&s, DOOR_CMD_OPEN);
     sim_run(&s, 40000);
-    CHECK(s.fsm.state == DOOR_STATE_FAULT);
+    CHECK(s.fsm.state == DOOR_STATE_CLOSED);          /* the previous state, no FAULT */
     CHECK(s.fsm.fault == DOOR_FAULT_OBSTRUCTED);
+    CHECK(s.fsm.result == DOOR_RESULT_RETURNED);
     CHECK(s.fsm.retries == CFG.max_retries);
     CHECK_NEAR(s.pos, 0, CFG.tolerance + 5);          /* ends back at closed */
     CHECK(s.reversals_without_brake == 0);
@@ -678,13 +679,159 @@ static void test_door_with_lock(void)
     CHECK(l.state == DOOR_LOCK_LOCKED);                        /* locked again at the end */
 }
 
+/* ---- door held (final firmware: no retries, back to the previous state) ----- */
+
+/* Current-sensor door with max_retries = 0, like config.h. */
+static void sim_init_held(sim_t *s)
+{
+    sim_init_current_mode(s);
+    s->cfg.max_retries = 0;
+}
+
+static void test_held_while_closing_goes_back_open(void)
+{
+    sim_t s; sim_init_held(&s);
+    sim_tick(&s, DOOR_CMD_OPEN);
+    run_until_finished(&s, 15000);
+    CHECK(s.fsm.state == DOOR_STATE_OPEN);
+
+    s.block_dir = -1; s.block_pos = OPEN_POS / 2;     /* a hand holds the door */
+    sim_tick(&s, DOOR_CMD_CLOSE);
+    run_until_finished(&s, 30000);
+    CHECK(s.guard_hits > 0);                          /* seen by the motor current */
+    CHECK(s.saw_state[DOOR_STATE_BACKING_OFF]);
+    CHECK(!s.saw_state[DOOR_STATE_RETRY_WAIT]);       /* no retry */
+    CHECK(s.fsm.state == DOOR_STATE_OPEN);
+    CHECK(s.fsm.fault == DOOR_FAULT_OBSTRUCTED);
+    CHECK(s.fsm.result == DOOR_RESULT_RETURNED);
+    CHECK_NEAR(s.pos, OPEN_POS, CFG.tolerance + 5);
+    CHECK(s.reversals_without_brake == 0);
+
+    /* It stays open... */
+    sim_run(&s, 5000);
+    CHECK(s.fsm.state == DOOR_STATE_OPEN);
+    CHECK_NEAR(s.speed_rpm, 0, 0.2);
+    /* ...until the next close; hand gone, it closes and the fault clears. */
+    s.block_dir = 0;
+    sim_tick(&s, DOOR_CMD_CLOSE);
+    CHECK(s.fsm.fault == DOOR_FAULT_NONE);
+    run_until_finished(&s, 30000);
+    CHECK(s.fsm.state == DOOR_STATE_CLOSED);
+    CHECK(s.fsm.result == DOOR_RESULT_DONE);
+}
+
+static void test_held_while_opening_goes_back_closed(void)
+{
+    sim_t s; sim_init_held(&s);
+    s.block_dir = +1; s.block_pos = OPEN_POS / 3;
+    sim_tick(&s, DOOR_CMD_OPEN);
+    run_until_finished(&s, 30000);
+    CHECK(s.guard_hits > 0);
+    CHECK(s.fsm.state == DOOR_STATE_CLOSED);
+    CHECK(s.fsm.fault == DOOR_FAULT_OBSTRUCTED);
+    CHECK(s.fsm.result == DOOR_RESULT_RETURNED);
+    CHECK_NEAR(s.pos, 0, CFG.tolerance + 5);
+    CHECK(s.reversals_without_brake == 0);
+}
+
+/* A close that interrupts an open half way still goes back to OPEN when held
+ * (the previous state is "open", not the spot where the close began). */
+static void test_held_after_mid_way_reversal_goes_to_other_end(void)
+{
+    sim_t s; sim_init_held(&s);
+    sim_tick(&s, DOOR_CMD_OPEN);
+    while (s.pos < OPEN_POS / 2) {
+        sim_tick(&s, DOOR_CMD_NONE);
+    }
+    float mid = s.pos;
+    s.block_dir = -1; s.block_pos = mid - 300;        /* held on the way down */
+    sim_tick(&s, DOOR_CMD_CLOSE);
+    CHECK(s.fsm.move_origin == OPEN_POS);
+    run_until_finished(&s, 30000);
+    CHECK(s.fsm.state == DOOR_STATE_OPEN);
+    CHECK(s.fsm.result == DOOR_RESULT_RETURNED);
+    CHECK_NEAR(s.pos, OPEN_POS, CFG.tolerance + 5);
+    CHECK(s.reversals_without_brake == 0);
+}
+
+/* MOVE commands (what the firmware uses) with an explicit anchor. */
+static void test_move_with_anchor(void)
+{
+    sim_t s; sim_init_held(&s);
+    door_fsm_cmd_t open = { .type = DOOR_CMD_MOVE, .absolute = true, .delta = OPEN_POS,
+                            .rpm = 3.0f, .has_anchor = true, .anchor = 0 };
+    sim_tick_cmd(&s, &open);
+    run_until_finished(&s, 30000);
+    CHECK(s.fsm.state == DOOR_STATE_OPEN && s.fsm.result == DOOR_RESULT_DONE);
+
+    /* close (aimed past 0, like the door switch search), held -> open */
+    door_fsm_cmd_t close = { .type = DOOR_CMD_MOVE, .absolute = true, .delta = -100,
+                             .rpm = 3.0f, .has_anchor = true, .anchor = OPEN_POS };
+    s.block_dir = -1; s.block_pos = OPEN_POS / 2;
+    sim_tick_cmd(&s, &close);
+    run_until_finished(&s, 40000);
+    CHECK(s.fsm.state == DOOR_STATE_OPEN);
+    CHECK(s.fsm.result == DOOR_RESULT_RETURNED);
+    CHECK_NEAR(s.pos, OPEN_POS, CFG.tolerance + 5);
+
+    /* from half way, opening, held -> back to the anchor 0 = CLOSED */
+    s.block_dir = 0;
+    door_fsm_cmd_t half = { .type = DOOR_CMD_MOVE, .absolute = true, .delta = OPEN_POS / 2,
+                            .rpm = 3.0f };
+    sim_tick_cmd(&s, &half);
+    run_until_finished(&s, 40000);
+    CHECK(s.fsm.state == DOOR_STATE_IDLE);
+    s.block_dir = +1; s.block_pos = OPEN_POS * 3 / 4;
+    sim_tick_cmd(&s, &open);
+    run_until_finished(&s, 40000);
+    CHECK(s.fsm.state == DOOR_STATE_CLOSED);
+    CHECK(s.fsm.result == DOOR_RESULT_RETURNED);
+    CHECK_NEAR(s.pos, 0, CFG.tolerance + 5);
+    CHECK(s.reversals_without_brake == 0);
+}
+
+/* No anchor given: a MOVE still goes back to where it started. */
+static void test_move_without_anchor_returns_to_start(void)
+{
+    sim_t s; sim_init_held(&s);
+    s.pos = 600;
+    s.block_dir = +1; s.block_pos = 1200;
+    door_fsm_cmd_t c = { .type = DOOR_CMD_MOVE, .absolute = true, .delta = OPEN_POS,
+                         .rpm = 3.0f };
+    sim_tick_cmd(&s, &c);
+    run_until_finished(&s, 40000);
+    CHECK(s.fsm.state == DOOR_STATE_IDLE);
+    CHECK(s.fsm.result == DOOR_RESULT_RETURNED);
+    CHECK_NEAR(s.pos, 600, CFG.tolerance + 5);
+}
+
+/* Held while going back too: stops where it is (stuck both ways).
+ * Speed check on, as in the firmware: a door that is already blocked when a
+ * leg starts makes the current guard learn the blocked current as "normal",
+ * so only the absolute limit or the speed check can catch it. */
+static void test_held_both_ways_stops(void)
+{
+    sim_t s; sim_init(&s);
+    s.cfg.max_retries = 0;
+    s.block_dir = +1; s.block_pos = OPEN_POS / 2;
+    sim_tick(&s, DOOR_CMD_OPEN);
+    while (s.fsm.state != DOOR_STATE_BACKING_OFF) {
+        sim_tick(&s, DOOR_CMD_NONE);
+    }
+    s.block_dir = -1; s.block_pos = s.pos;
+    run_until_finished(&s, 10000);
+    CHECK(s.fsm.state == DOOR_STATE_FAULT);
+    CHECK(s.fsm.fault == DOOR_FAULT_BLOCKED);
+    CHECK(s.fsm.result == DOOR_RESULT_BLOCKED);
+}
+
 int main(void)
 {
     printf("door_fsm / motor_control\n");
     RUN(test_open_then_close);
     RUN(test_repeated_command_is_ignored);
     RUN(test_interference_then_success);
-    RUN(test_persistent_interference_faults);
+    RUN(test_persistent_interference_goes_back_closed);
     RUN(test_closing_on_obstacle_reopens);
     RUN(test_blocked_both_ways);
     RUN(test_stop_command);
@@ -710,5 +857,11 @@ int main(void)
     RUN(test_lock_sequence);
     RUN(test_lock_new_move_while_locking);
     RUN(test_door_with_lock);
+    RUN(test_held_while_closing_goes_back_open);
+    RUN(test_held_while_opening_goes_back_closed);
+    RUN(test_held_after_mid_way_reversal_goes_to_other_end);
+    RUN(test_move_with_anchor);
+    RUN(test_move_without_anchor_returns_to_start);
+    RUN(test_held_both_ways_stops);
     return check_summary("door");
 }

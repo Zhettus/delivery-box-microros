@@ -1,427 +1,257 @@
-# Delivery Box — ESP32-S3 firmware with micro-ROS
+# Delivery Box — ESP32-S3 firmware, controlled over micro-ROS
 
-Firmware for the delivery box mounted on the quadruped robot, for the
-**ESP32-S3-WROOM-1 N16R8** and the wiring in
-*Delivery_Box_Wiring_N16R8 — Revision 4*.
+Firmware for the delivery box on the **ESP32-S3-WROOM-1 N16R8**, with the same
+hardware setup and logic as `delivery-box-final`, and **everything controlled
+and reported over ROS 2 (Jazzy) topics** through micro-ROS:
 
-This is `delivery-box-esp32s3` plus a **micro-ROS (ROS 2 Jazzy) node**. The robot
-sets the box states over ROS 2 topics. The serial commands still work for
-debugging. The micro-ROS setup (native USB transport, agent command) is the same
-as in `hub-motor-microros`. See [ROS 2 interface](#ros-2-interface-micro-ros) below.
+- robot states (LED strip, face, tail lights, sound, door together)
+- the door: open / close / go to an angle / stop / home / latch, with
+  **door-held detection** (INA228 motor current: closing → opens again,
+  opening → closes again)
+- status: state, door state + result, latch, door angle, motor supply power
+- **microphone → computer**: the ICS43434, streamed live (16 kHz)
+- **computer → speaker**: audio sent in 10 ms pieces and played on the WM8960
+  HAT (`tools/speak.py`: a WAV file, the computer's microphone, or a tone)
+- built-in sounds and speaker volume
 
-| Subsystem | Hardware | ESP32-S3 peripheral | Pins |
-|---
-
-## ROS 2 interface (micro-ROS)
-
-### Two USB-C ports, two jobs
+## Two USB-C ports, two jobs
 
 | Board port | Linux device | Used for |
 |---|---|---|
-| **"USB"** (native USB, GPIO 19/20) | `/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_*` | **micro-ROS** ↔ agent |
-| **"UART"/"COM"** (CH343 USB-UART bridge, GPIO 43/44) | `/dev/serial/by-id/usb-1a86_*` | flashing, logs, serial commands |
+| **"USB"** (native USB, GPIO 19/20) | `/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_*` | **micro-ROS** ↔ agent (flashing works too) |
+| **"UART"/"COM"** (CH343 USB-UART bridge, GPIO 43/44) | `/dev/serial/by-id/usb-1a86_*` | logs (`idf.py monitor`), flashing |
 
-Connect **both** while developing. On the robot, only the "USB" port is needed.
-Both ports show up as `/dev/ttyACM*` (the CH343 bridge uses the `cdc_acm` driver,
-so there is **no** `/dev/ttyUSB0`), and whichever is plugged in first gets
-`ttyACM0`. Use the `/dev/serial/by-id/` names above, or check with
-`ls -l /dev/serial/by-id/`. Flashing also works through the native port, but the
-logs and serial commands are only on the UART port.
+Both ports show up as `/dev/ttyACM*` on Linux (whichever is plugged in first
+gets `ttyACM0`), so use the `/dev/serial/by-id/` names. On a Mac:
+`/dev/cu.usbmodem*` is the native port, `/dev/cu.usbserial*` /
+`/dev/cu.wchusbserial*` the UART one. **Never open a monitor on the native port**
+while ROS runs: one program per port.
 
-### Run it
+## Run it
 
 ```bash
-# 1. Flash (through the UART port) and watch the logs
+# 1. Build + flash through the UART port and watch the logs
 . ~/.espressif/tools/activate_idf_v5.2.7.sh
 cd ~/delivery-box-esp32s3-microros
-idf.py -DMOTOR_TEST=0 -p /dev/serial/by-id/usb-1a86_* build flash monitor     # exit with Ctrl+]
+idf.py -p /dev/serial/by-id/usb-1a86_* build flash monitor          # Ctrl+] quits
 
-# 2. Second terminal: start the agent on the native USB port (same as hub-motor)
-source /opt/ros/jazzy/setup.bash && source ~/uros_ws/install/setup.bash
-ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/ttyACM0 -b 115200
+# 2. Second terminal: the agent on the native USB port
+source /opt/ros/jazzy/setup.bash && source ~/uros_ws/install/local_setup.bash
+ros2 run micro_ros_agent micro_ros_agent serial \
+     --dev /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_* -b 115200
 
 # 3. Third terminal: talk to the box
 source /opt/ros/jazzy/setup.bash
 ros2 topic list | grep delivery_box
 ```
 
-The log shows `ros: connected: node 'delivery_box' is up`. If the agent is
-restarted or the cable is re-plugged, the box reconnects on its own.
+The log shows `ros: connected: node 'delivery_box' is up`. If the agent restarts
+or the cable is re-plugged, the box reconnects by itself.
 
-### Commands: topics the computer publishes
+**Power up with the door closed:** the shaft position at power-up is "closed" (0°).
+
+## Topics
+
+All names start with `/delivery_box/` (`ROS_TOPIC_PREFIX` in `main/config.h`).
+
+### The computer sends
 
 | Topic | Type | Values | What the box does |
 |---|---|---|---|
-| `/delivery_box/set_state` | `std_msgs/String` | a state name (below) | changes LEDs, eyes, tail light **and the door** together |
-| `/delivery_box/door_cmd` | `std_msgs/String` | `open` | unlocks the latch, opens to 90° at 5 rpm and stays open |
-| | | `close` | closes to 0° at 5 rpm, then locks the latch |
-| | | `stop` | stops the door where it is (latch stays retracted if not closed) |
-| | | `home` | closes slowly until the end stop and sets that as 0° (door position lost) |
-| | | `unlock` | keeps the latch retracted even when closed (opening by hand, maintenance) |
-| | | `lock` | back to automatic latch control (locks if the door is closed) |
-| `/delivery_box/door_goto` | `std_msgs/Float32` | 0 … 90 | moves the door to that angle (e.g. `45.0` = half open), same speed and safety |
+| `set_state` | `std_msgs/String` | a state name (below) | LEDs, face, tail lights, sound **and the door** together |
+| `door_cmd` | `std_msgs/String` | `open` | unlocks the latch, nudges, opens to `DOOR_OPEN_ANGLE_DEG` |
+| | | `close` | closes until the door switch, seats, latch locks |
+| | | `stop` | stops where it is |
+| | | `home` | closes slowly to the end stop and takes that as 0° |
+| | | `unlock` / `lock` | keep the latch retracted (open by hand) / automatic again |
+| `door_goto` | `std_msgs/Float32` | 0 … 90 | goes to that angle (0 = closed) |
+| `sound` | `std_msgs/String` | `startup` `arrived` `greeting` `warning` `failure` `door_held` | plays that sound |
+| | | `stop` | stops the sound and the speaker stream |
+| | | `volume 70` | speaker volume 0 … 100 |
+| `mic/enable` | `std_msgs/Bool` | `true` / `false` | streams the microphone / stops |
+| `speaker/audio` | `std_msgs/Int16MultiArray` | 160 samples, 16 kHz mono | plays it (best effort, see below) |
 
-### Robot states (`set_state`)
-
-| State | LED strips | Eyes | Tail light | Door |
-|---|---|---|---|---|
-| `startup` | white pulse | breathing | off | unchanged |
-| `moving_with_task` | blue pulse | on | running light | **closes + locks** |
-| `moving_without_task` | white pulse | on | running light | **closes + locks** |
-| `success_waiting` | green pulse | on | running + brake | unchanged |
-| `success_open_door` | solid green | on | running + brake | **unlocks + opens**, stays open |
-| `success_close_door` | solid green | on | running + brake | **closes + locks** |
-| `failure` | red pulse | on | running + brake + hazards | **stops where it is** |
-| `failure_not_critical` | yellow pulse | on | running + brake | unchanged |
-| `charging` | cyan comet around the box | breathing with the comet | off | unchanged |
-
-- Setting the same state twice is harmless: the door goes **to** open/closed, never "by" an angle.
-- A door that can't finish (resistance on every retry, timeout) switches the box to
-  `failure_not_critical` **by itself**. This is the only state change the box makes on its own.
-- An unknown state or door command is ignored and logged.
-
-### Status: topics the box publishes
+### The box sends
 
 | Topic | Type | When | Content |
 |---|---|---|---|
-| `/delivery_box/state` | `std_msgs/String` | on change + every 1 s | current robot state |
-| `/delivery_box/door_state` | `std_msgs/String` | on change + every 1 s | `closed` `opening` `open` `closing` `idle` `stopped` `backing_off` `retry_wait` `homing` or `fault:<reason>` |
-| `/delivery_box/door_result` | `std_msgs/String` | when a move ends | `done` · `returned` (resistance every try, back at the start) · `blocked` · `stopped` · `timeout` · `sensor_fail` |
-| `/delivery_box/latch` | `std_msgs/String` | on change + every 1 s | `locked` `unlocking` `unlocked` `locking` |
-| `/delivery_box/door_angle` | `std_msgs/Float32` | 5 Hz | door angle in degrees, 0 = closed |
-| `/delivery_box/power` | `sensor_msgs/BatteryState` | 1 Hz | INA228: motor supply voltage, motor current (negative = drawn), sensor temperature |
+| `state` | `std_msgs/String` | change + 1 Hz | current robot state |
+| `door_state` | `std_msgs/String` | change + 1 Hz | `closed`, `opening`, `open`, `closing`, …; `open:held` / `closed:held` after the door was held and went back; `fault:not_closed`, `fault:blocked`, … |
+| `door_result` | `std_msgs/String` | when a move ends | `done`, `returned` (held), `blocked`, `stopped`, `timeout`, `sensor_fail`, `not_closed` |
+| `latch` | `std_msgs/String` | change + 1 Hz | `locked`, `unlocking`, `unlocked`, `locking` |
+| `door_angle` | `std_msgs/Float32` | 5 Hz | degrees, 0 = closed |
+| `power` | `sensor_msgs/BatteryState` | 1 Hz | motor supply voltage and current (INA228) |
+| `mic/status` | `std_msgs/Bool` | change + 1 Hz | microphone streaming? |
+| `mic/audio` | `std_msgs/Int16MultiArray` | 100 Hz while on | 160 samples = 10 ms of 16 kHz mono |
+| `speaker/status` | `std_msgs/String` | change + 1 Hz | `idle`/`playing buffered=…ms lost=… dropped=… underruns=…` |
 
 ### Examples
 
 ```bash
-# a delivery
-ros2 topic pub --once /delivery_box/set_state std_msgs/msg/String "{data: moving_with_task}"
-ros2 topic pub --once /delivery_box/set_state std_msgs/msg/String "{data: success_waiting}"
 ros2 topic pub --once /delivery_box/set_state std_msgs/msg/String "{data: success_open_door}"
-ros2 topic pub --once /delivery_box/set_state std_msgs/msg/String "{data: success_close_door}"
-ros2 topic pub --once /delivery_box/set_state std_msgs/msg/String "{data: moving_without_task}"
-
-# the door directly
-ros2 topic pub --once /delivery_box/door_cmd  std_msgs/msg/String  "{data: open}"
-ros2 topic pub --once /delivery_box/door_cmd  std_msgs/msg/String  "{data: close}"
+ros2 topic pub --once /delivery_box/door_cmd  std_msgs/msg/String "{data: close}"
 ros2 topic pub --once /delivery_box/door_goto std_msgs/msg/Float32 "{data: 45.0}"
-
-# watch
-ros2 topic echo /delivery_box/state
+ros2 topic pub --once /delivery_box/sound     std_msgs/msg/String "{data: 'volume 60'}"
 ros2 topic echo /delivery_box/door_state
-ros2 topic echo /delivery_box/door_result
-ros2 topic echo /delivery_box/latch
+tools/ros_demo.sh                 # a whole delivery, state by state
 ```
 
-`tools/ros_demo.sh` walks through a whole delivery with a pause between states.
-
-### If the ROS connection is lost
-
-- A moving door is **stopped** (`APP_ROS_STOP_DOOR_WHEN_LOST`).
-- Set `APP_ROS_WARN_WHEN_LOST 1` to also switch to `failure_not_critical`.
-- Everything else keeps its current look. The node reconnects by itself.
-
-### micro-ROS build notes
-
-- The micro-ROS library is built **inside this project** from
-  `components/micro_ros_espidf_component` (copied from `hub-motor-microros`,
-  which is left untouched). The first `idf.py build` takes a few minutes; later
-  builds reuse `libmicroros.a`.
-- `app-colcon.meta` sets the custom transport and the entity limits
-  (6 publishers, 4 subscriptions). After changing it, run
-  `idf.py clean-microros` once, then build again. That rebuilds the library.
-- `sdkconfig.defaults` turns **off** the secondary console on the native USB port,
-  because log text there would corrupt the micro-ROS stream.
-
----
-
-## Quick start
+## Microphone → computer
 
 ```bash
-# 1. Activate ESP-IDF 5.2.7 (installed with the EIM installer)
-. ~/.espressif/tools/activate_idf_v5.2.7.sh
-
-# 2. Build (the target esp32s3 is set by sdkconfig.defaults)
-cd ~/delivery-box-esp32s3-microros
-idf.py build
-
-# 3. Flash through the "UART" USB-C port, then open the console there
-idf.py -p /dev/serial/by-id/usb-1a86_* flash monitor        # exit the monitor with Ctrl+]
+python3 tools/listen_live.py              # switches it on, plays it, off on Ctrl+C
+python3 tools/listen_live.py --wav a.wav  # also save it;  --no-play: statistics only
 ```
 
-On boot you'll see every subsystem report `ready`, a summary line, and:
+Pipeline on the board: I2S 48 kHz → high-pass, automatic gain, limiter →
+16 kHz → 10 ms chunks → `mic/audio`. `layout.data_offset` is the index of the
+first sample: the listener fills lost chunks with silence. The mic is OFF after
+boot and after every reconnect. Tuning: `MIC_*` in `main/config.h`.
 
-```
-I (812) main: subsystems: door=OK tail=OK eyes=OK leds=OK i2c=OK power=OK mic=OK speaker=OK
-EVT state startup
-EVT ready (type 'help')
-```
+## Computer → speaker ("audio by bits")
 
-Anything shown as `--` failed to start (unplugged, wrong address…). The rest
-keeps working. **First time on new hardware? Follow [docs/bring-up.md](docs/bring-up.md).**
+The mirror image of the microphone: the computer cuts the audio into 10 ms
+pieces (160 samples, 16 kHz mono int16), numbers them by sample
+(`layout.data_offset`, 0 = a new stream) and sends them in real time on
+`speaker/audio`. The box:
 
-Host unit tests (no board needed):
+1. puts each piece in a 500 ms buffer; a gap in the numbers (lost piece) is
+   filled with silence, so the timing stays right; old/duplicate pieces are
+   dropped,
+2. starts playing once 100 ms are buffered (absorbs USB/ROS jitter),
+3. upsamples 16 → 48 kHz (`components/audio/audio_resample.c`) and plays it,
+4. stops 300 ms after the last piece.
 
 ```bash
-cd test/host && make        # door state machine, LED effects, WM8960 PLL, INA228 maths
+python3 tools/speak.py --wav hello.wav           # any PCM WAV: converted to 16 kHz mono
+python3 tools/speak.py --live                    # talk into the computer (arecord)
+python3 tools/speak.py --tone 440 --seconds 2
+python3 tools/speak.py --wav hello.wav --volume 70 --gain 1.5
+ros2 topic echo /delivery_box/speaker/status     # lost / dropped / underruns
 ```
 
----
+A built-in sound (a state change, `sound`) plays in between and then the
+stream continues. Settings: `SPEAKER_*` in `main/config.h`.
 
-## Robot states
+## Robot states (`set_state`)
 
-The robot (for example a ROS node on the main computer) sets **one state** and
-the box does the rest. Defined in [`main/robot_state.c`](main/robot_state.c):
-
-| State | LED strips | Eyes | Tail light | Door | Sound |
+| State | Strip | Face | Tail | Door | Sound |
 |---|---|---|---|---|---|
-| `startup` | white pulse | thinking (breathing) | off | — | start-up chime |
-| `moving_with_task` | blue pulse | on | run | **close** | — |
-| `moving_without_task` | white pulse | on | run | **close** | — |
-| `success_waiting` | green pulse | on | run + brake | — | arrival chime |
-| `success_open_door` | solid green | on | run + brake | **open** (stays open) | door chime |
-| `success_close_door` | solid green | on | run + brake | **close** | door chime |
-| `failure` | red pulse | on | run + brake + both indicators | **stop** | alarm |
-| `failure_not_critical` | yellow pulse | on | run + brake | — | warning beeps |
-| `charging` | cyan comet around the box | breathing in sync with the comet | off | — | — |
+| `startup` | white pulse | thinking | off | – | start-up notes |
+| `moving_with_task` | blue pulse | on | off | closes | – |
+| `moving_without_task` | white pulse | on | off | closes | – |
+| `success_waiting` | green pulse | on | off | – | two notes |
+| `success_open_door` | green solid | on | off | opens | `gm.wav` |
+| `success_close_door` | green solid | on | off | closes + locks | – |
+| `failure` | red pulse | on | brake | stops | falling notes |
+| `failure_not_critical` | yellow pulse | on | off | – | two beeps |
+| `charging` | cyan comet | follows the comet | off | – | – |
 
-State sounds are currently **off** (`APP_AUDIO_STATE_SOUNDS 0` in `main/app_config.h`), so
-the "Sound" column is what plays when you set it back to `1`. The speaker still works
-for `beep` and your own code.
+If the door gives up (stuck both ways, timed out, not closed), the box switches
+to `failure_not_critical` by itself. `DEMO_MODE 1` cycles through the states
+until the first ROS command.
 
-**Door in the states** (`STATES[]` in `main/robot_state.c`, values in `main/app_config.h`):
+## Someone holds the door
 
-| State | Door action | How |
+While the door moves, the INA228 reads the motor current every 5 ms. Held =
+current above `DOOR_CURRENT_LIMIT_A`, or `DOOR_CURRENT_RISE_A` above the normal
+running current, for `DOOR_CURRENT_CONFIRM_MS` (also: door much slower than
+commanded). Then:
+
+| Door was | Held → it | Ends as |
 |---|---|---|
-| `success_open_door` | **open** | `door_move_to(APP_DOOR_OPEN_DEG, APP_DOOR_OPEN_RPM, APP_DOOR_OPEN_LIMIT_A)` |
-| `success_close_door`, `moving_with_task`, `moving_without_task` | **close** | `door_move_to(0, APP_DOOR_CLOSE_RPM, APP_DOOR_CLOSE_LIMIT_A)` |
-| `failure` | **freeze** | `door_stop()` |
-| all others | keep as it is | — |
+| closing | stops, opens again | `open:held`, result `returned` |
+| opening | stops, closes again (seats on the switch, latch locks) | `closed:held`, result `returned` |
+| going back, held again | stops where it is | `fault:blocked` |
 
-- **Absolute moves:** states always go **to** open or closed (never "by" an angle),
-  so sending a state twice is harmless.
-- **Resistance:** each move goes back to where it started, waits and retries.
-- **The robot never drives with the door open:** both *moving* states close it.
-- **Door fault:** a door that gives up (`RETURNED`, `BLOCKED`, `TIMEOUT`) switches the box to
-  `failure_not_critical` and sends `EVT door fault <reason> <result>`.
+The box beeps (`door_held` sound). The thresholds are estimates **[MEASURE]**:
+measure with `motor-audio-check` (`idf.py -DCURRENT_LOG=1`).
 
-To change a look, edit that state's row in `STATES[]`. There is one row per state.
+## Pins
 
----
+Same as `delivery-box-final` (`main/board.h`, checked at compile time):
 
-## Door behaviour
+| GPIO | Signal |
+|---|---|
+| 1, 2 | I2C SDA / SCL, 100 kHz: INA228 (0x40) + WM8960 HAT (0x1A) |
+| 4 | LED strip data (one WS2815 strip, 134 LEDs) |
+| 5 | door-closed switch to GND (closed = LOW) |
+| 8, 9, 10, 11 | tail light brake / run / left / right |
+| 12 | face: eyes + mouth (one XY-MOS) |
+| 14, 15, 16 | I2S BCLK / WS / DOUT → WM8960 P12 / P35 / P40 (+ ICS43434 BCLK / LRCL) |
+| 17 | I2S DIN ← ICS43434 DOUT (SEL → GND, 3V → 3.3 V) |
+| 18 / 21 / 40 / 38 | motor PWM / DIR / BRAKE / FG |
+| 41 | door latch solenoid (XY-MOS) |
+| 19, 20 | native USB: micro-ROS |
+| 43, 44 | UART0: logs |
 
-The door motor runs a closed-loop state machine at 50 Hz
-([`components/door/door_fsm.c`](components/door/door_fsm.c), unit-tested):
+## Building
 
-```
- CLOSED ──open──► OPENING ──arrived──► OPEN ──close──► CLOSING ──arrived──► CLOSED
-                     │                                    │
-                interference                         interference
-                     ▼                                    ▼
-               BACKING_OFF  (go back to where the move started)
-                     │ arrived
-                     ▼
-               RETRY_WAIT  (3 s) ──► try the same move again
-                     │
-          after 3 failed retries ──► FAULT (door is back at its start)
-```
+### micro-ROS library
 
-- **Interference** means the door keeps moving slower than 35 % of the commanded
-  speed for 300 ms (the first 500 ms after starting or reversing are ignored).
-- **Motor:** a brushless gear motor with its own built-in driver. The ESP32
-  sets speed (PWM), direction (DIR) and brake, and counts the FG speed pulses
-  for position. FG has no direction, so pulses are signed by the driven
-  direction.
-- **Before any reversal** the motor is stopped and braked, and the firmware
-  waits until FG shows standstill. This is enforced in one place
-  ([`motor_control.c`](components/door/motor_control.c)).
-- A brushed motor + DRI0042 is still supported (`APP_DOOR_MOTOR_TYPE 1`).
-- The door assumes it is **closed at power-up**. If it might not be, send
-  `door home`: it closes slowly until it touches the end stop and zeroes there.
-- `FAULT` clears with any new `door open` / `door close` / `door home`.
+`components/micro_ros_espidf_component` (git submodule: branch `jazzy`, commit
+`16cf0d5`, plus the local `PATH` line in `libmicroros.mk`; for a new computer
+see `MICRO_ROS_NEW_COMPUTER_SETUP.md`, in ~/Downloads). `app-colcon.meta` sets the custom transport
+and the limits: **10 publishers, 6 subscriptions, history 8** (the node uses 9
+and 6).
 
-### Latch (solenoid lock)
-
-Every door move is wrapped in the lock sequence
-([`door_lock.c`](components/door/door_lock.c), unit-tested). Nothing else
-has to handle it:
-
-```
- LOCKED ──open──► UNLOCKING ──200 ms──► OPENING ──at 90°──► OPEN
- solenoid OFF      solenoid ON           solenoid ON         solenoid ON, motor off
- motor off         motor waits                                  │ `door close` or success_close_door
-    ▲                                                           ▼
- LOCKED ◄──100 ms── LOCKING ◄──────at 0°, stopped─────────── CLOSING
-                   motor off, solenoid ON                    solenoid ON
-```
-
-- The "door open / door closed sensors" are the motor's FG position (0° and
-  `APP_DOOR_OPEN_DEG`). No limit switches are needed.
-- The latch never extends while the door is away from 0°, so it stays retracted
-  during resistance handling, retries and after a fault (the door can't latch
-  there anyway). Moving again during LOCKING unlocks at once, with no wait.
-- A command that doesn't move the door (e.g. `close` when already closed) doesn't
-  touch the latch.
-- Auto-close: `APP_DOOR_HOLD_OPEN_MS` (0 = stay open until `door close` / `success_close_door`; e.g. 30000 = close by itself after 30 s).
-- Timings and hold power: `APP_LATCH_*` in `main/app_config.h`.
-  `APP_LATCH_ENABLED 0` if no solenoid is fitted.
-
----
-
-## Motor test
-
-`main/motor_test.c` is a separate program for the door motor alone. It has
-the same logic as the old ZK-BM1 program: PI speed control with
-feed-forward, stall detection, and `set_motor_speed_rpm()` with a
-+5 rpm / stop / −5 rpm loop. It is adapted to the brushless motor with its
-own driver (SPEED PWM, DIR, BRAKE and FG pulses).
-
-At start-up it runs a **wire check**. This finds which of blue (GPIO40),
-green (GPIO18) and white (GPIO21) is SPEED, DIR and BRAKE, and at which
-level. Paste the printed `#define` lines and set `WIRE_CHECK 0` to skip it.
-Run it with the motor **not attached to the door**.
+After changing `app-colcon.meta`, rebuild only the compiled part, keeping the
+pinned sources in `micro_ros_src/src` (`idf.py clean-microros` would delete
+them and download again):
 
 ```bash
-idf.py -DMOTOR_TEST=1 -p /dev/serial/by-id/usb-1a86_* build flash monitor   # motor test (output on the UART port)
-idf.py -DMOTOR_TEST=0 -p /dev/serial/by-id/usb-1a86_* build flash monitor   # firmware with micro-ROS
+C=components/micro_ros_espidf_component
+rm -rf $C/libmicroros.a $C/include $C/micro_ros_src/build $C/micro_ros_src/install $C/micro_ros_src/log
+idf.py build                       # rebuilds the library: several minutes
 ```
 
----
+`sdkconfig.defaults` puts the console on UART0 and turns the secondary console
+off: log text on the native port would corrupt the micro-ROS stream.
 
-## Moving the door from code
+### Tests on the computer
 
-`components/door/include/door.h`:
-
-```c
-door_open_by(90.0f, 8.0f, 0.50f);    // open 1/4 turn at 8 rpm, current limit 0.5 A
-door_close_by(120.0f, 8.0f, 0.50f);  // close 1/3 turn
-
-door_move_t m = door_move_defaults(180.0f, 8.0f);   // half turn, full control:
-m.current.limit_a = 0.40f;  m.current.rise_a = 0.08f;
-m.return_rpm = 4.0f;  m.max_retries = 3;  m.retry_wait_ms = 3000;
-door_result_t r = door_rotate(&m);   // DONE / RETURNED / BLOCKED / STOPPED / TIMEOUT / SENSOR_FAIL
+```bash
+cd test/host && make      # door state machine + mic DSP + speaker upsampler
 ```
-
-- **Anchor:** every move remembers where it started. On resistance (motor current
-  above the limit), the door stops, goes back to the anchor (counted in FG
-  pulses, not seconds), waits, and retries.
-- **Giving up:** after `max_retries` it stays at the anchor and returns `RETURNED`.
-- **Blocked both ways:** if the way back is blocked too, it stops there and returns `BLOCKED`.
-- **Timeout:** each attempt has a time limit (automatic: 2 × travel time + 3 s) as a
-  backup to the pulse count.
-- **Serial:** `door rotate <degrees> <rpm> [limit_A]` does the same from the serial port.
-- **Bench test:** `main/door_motion_test.c` (settings at the top of the file).
-
----
-
-## Serial commands
-
-On the "UART"/"COM" USB-C port (`/dev/serial/by-id/usb-1a86_*`). The native "USB" port carries micro-ROS.
-
-| Command | Example | What it does |
-|---|---|---|
-| `help` | | list commands |
-| `status` | | one-line overview of everything |
-| `states` | | list the robot states |
-| `state [name]` | `state success_open_door` | get / set the robot state |
-| `next` / `prev` | `next` | step to the next / previous state (list order) |
-| `demo on [seconds] [door]` | `demo on 5 door` | cycle through a realistic delivery sequence; `door` = also move the door |
-| `demo off` | | stop cycling |
-| `door open\|close\|stop\|home\|status` | `door status` | door control + position, speed, duty, latch |
-| `door unlock` / `door lock` | `door unlock` | keep the latch retracted even when closed (manual opening, solenoid test) / back to automatic |
-| `leds <effect> [r g b] [time_s]` | `leds comet 0 255 255 2` | effects: off solid pulse blink comet fill diverge identify |
-| `leds max <0-255>` | `leds max 120` | global LED brightness ceiling |
-| `eyes off\|thinking\|constant [fade_s]` | `eyes thinking 1.5` | eye mood |
-| `eyes cap <0-1>` | `eyes cap 0.2` | eye brightness ceiling |
-| `tail brake\|run\|left\|right <0-255> [fade_ms]` | `tail brake 255` | one tail-light function |
-| `tail off` | | all tail lights off |
-| `volume [0-100]` | `volume 60` | speaker volume |
-| `beep [freq_hz] [ms]` | `beep 880 300` | test tone |
-| `mic [window_ms]` | `mic 1000` | microphone RMS / peak level in dBFS |
-| `power [reset]` | `power` | INA228: voltage, current, power, energy |
-| `i2c scan` | | should find 0x1A (WM8960) and 0x40 (INA228) |
-| `reboot` | | restart |
-
-Events: `EVT state <name>`, `EVT door <state> <fault> <result>`,
-`EVT power low_voltage <V>`, `EVT power high_current <A>`, `EVT ready`.
-
-Manual `leds` / `eyes` / `tail` commands override the current state's look
-until the next `state …` command.
-
----
 
 ## Project layout
 
-```
-delivery-box-esp32s3-microros/
-├── main/
-│   ├── board.h            ← PIN MAP: single source of truth (+ compile-time pin checks)
-│   ├── app_config.h       ← ALL tunables: brightness, door angles/speeds, volume, shunt…
-│   ├── main.c             ← start-up order
-│   ├── robot_state.c/.h   ← state table: what each robot state looks/sounds like
-│   ├── demo.c/.h          ← cycles through all states (APP_DEMO_MODE / `demo on`)
-│   ├── commands.c/.h      ← serial command interface
-│   ├── door_setup.h       ← door config from board.h + app_config.h
-│   ├── ros_interface.c/.h ← micro-ROS node: topics → states / door, status → topics
-│   ├── usb_jtag_transport.c/.h ← micro-ROS transport over the native USB port
-│   ├── motor_test.c       ← separate program: motor wire check + speed test
-│   └── power_monitor.c/.h ← periodic INA228 readings + warnings
-├── components/            ← one reusable driver per subsystem (no pins hard-coded)
-│   ├── led_strips/        ← WS2815 ×4 over RMT; led_effects.c = pure pixel maths
-│   ├── eyes/              ← JZ-MOS eyes, gamma + breathing
-│   ├── tail_lights/       ← 4 dimmable channels with hardware fades
-│   ├── door/              ← BLDC motor + FG, door_fsm, latch (door_lock), current guard, speed PI
-│   ├── audio/             ← full-duplex I2S: tone player + microphone
-│   ├── wm8960/            ← codec driver; wm8960_clock.c = PLL maths
-│   ├── ina228/            ← power monitor; ina228_conv.c = unit conversions
-│   └── pwm_util/          ← shared LEDC helpers
-├── test/host/             ← PC unit tests for all hardware-independent logic
-├── docs/
-│   ├── wiring.md          ← wiring reference + hardware notes
-│   ├── bring-up.md        ← first power-on checklist and calibration
-│   └── migration.md       ← what changed from the old ESP32 code, and why
-├── tools/ros_demo.sh    ← walks through a delivery over ROS 2
-├── app-colcon.meta      ← micro-ROS transport + entity limits
-├── sdkconfig.defaults     ← ESP32-S3, 16 MB flash, octal PSRAM, 1 kHz tick
-└── CMakeLists.txt
-```
-
-**Where to change things:**
-
-| I want to… | Edit |
+| Path | What |
 |---|---|
-| move a signal to another GPIO | `main/board.h` (the build refuses forbidden/duplicate pins) |
-| change door angle, speed, retry timing | `main/app_config.h` → *Door* |
-| change colours/sounds/door action of a state | `main/robot_state.c` → `STATES[]` |
-| change LED count or the loop direction | `main/app_config.h` → *LED strips* |
-| demo all states on the bench | `APP_DEMO_MODE 1` in `main/app_config.h` |
-| add a serial command | `main/commands.c` → `COMMANDS[]` |
+| `main/main.c` | starts everything, then ROS is in control |
+| `main/ros_interface.c` | the micro-ROS node: all topics |
+| `main/states.c` | robot states (own task: setting one never blocks ROS) |
+| `main/motor.c` | door front end (open/close with held-door reversal, go-to, home, latch, supply) |
+| `main/mic_stream.c` | microphone capture → 16 kHz chunks |
+| `main/sound.c` | built-in sounds + speaker stream settings |
+| `main/led.c`, `face.c`, `tail_light.c` | LED strip, face, tail lights |
+| `main/demo.c` | `DEMO_MODE` |
+| `main/usb_jtag_transport.c` | micro-ROS transport over the native USB port |
+| `main/config.h` / `board.h` | every tunable value / every pin |
+| `components/door` | door control: speed loop, latch, switch, current guard, held → go back |
+| `components/audio` | one full-duplex I2S: WM8960 playback, ICS43434 capture, `mic_dsp`, `audio_resample`, speaker stream buffer |
+| `components/ina228` | current sensor driver |
+| `tools/listen_live.py` | listen to the box microphone |
+| `tools/speak.py` | send audio to the box speaker |
+| `tools/ros_demo.sh` | walk through a delivery over ROS |
 
----
+## Changes from the previous version (branch `main`)
 
-## Task / priority map
+- Hardware setup of `delivery-box-final`: one LED strip (134), one face output,
+  door-closed switch on GPIO 5, tail lights on/off, I2C at 100 kHz, WM8960 set up
+  as in `motor-audio-check` (ESP32 = I2S master, 48 kHz).
+- Door logic of `delivery-box-final`: switch seating, latch timing, open nudge,
+  held door → back to the previous state (no automatic retries by default).
+- New topics: `sound`, `mic/enable`, `mic/status`, `mic/audio`, `speaker/audio`,
+  `speaker/status`; `door_state` shows `:held`.
+- The serial command shell, the motor test program and the old docs are gone
+  (ROS is the control path); they are in the git history.
 
-| Task | Priority | Period | Notes |
-|---|---|---|---|
-| `door` | 10 | 20 ms | highest: motor safety. Never prints or blocks; supervised by the task watchdog (2 s) |
-| `door_evt` | 3 | on event | logs door events, runs the state callback |
-| `audio` | 5 | on demand | tone synthesis → I2S |
-| `eyes` | 4 | 10 ms | |
-| `leds` | 3 | 10 ms | ~3 ms per frame for 96 pixels on 4 strips |
-| `commands` | 2 | on input | |
-| `power` | 1 | 1 s | |
+## Not yet checked on the hardware
 
----
-
-## Open items (from the wiring document §9)
-
-- **Mic streaming path (Wi-Fi → ROS topic)** is not decided yet. The I2S capture
-  is ready: `audio_mic_read()` returns 32 kHz mono 24-bit samples. A streaming
-  task only needs to call it in a loop and send the buffers.
-- **Interference detection** uses speed deviation from the encoder (method
-  "absolute threshold on speed ratio"). If a moving-average or baseline-profile
-  method is preferred later, only `obstructed()` in `door_fsm.c` changes, and the
-  host test `test_door_fsm.c` shows how to check it.
-- **Acoustic sealing** for the mic (gasket, Gore IP67 vent) is unaffected by firmware.
-# delivery-box-microros
+- Speaker with 32-bit I2S slots (needed by the microphone): it should play as
+  with 16-bit slots in `motor-audio-check`.
+- Microphone at 48 kHz (the hand-off tested 32 kHz).
+- Streaming both ways at once over one USB link (~35 kB/s each way).
+- If the audio HAT's supply runs through the INA228 shunt, speaker current
+  during a door move could look like a held door.

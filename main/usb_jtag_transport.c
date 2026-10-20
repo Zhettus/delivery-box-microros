@@ -28,7 +28,7 @@
 
 #include <uxr/client/profile/transport/custom/custom_transport.h>
 
-#define USB_JTAG_RX_BUF   1024
+#define USB_JTAG_RX_BUF   4096    /* the speaker stream arrives at ~35 kB/s */
 #define USB_JTAG_TX_BUF   1024
 
 bool usb_jtag_open(struct uxrCustomTransport *transport)

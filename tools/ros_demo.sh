@@ -3,7 +3,7 @@
 # Needs the micro-ROS agent running:
 #   ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/ttyACM0 -b 115200
 # Usage: tools/ros_demo.sh [seconds_per_state]   (default 8: the door needs
-#        ~3 s to open or close at 5 rpm)
+#        ~6 s to open or close at 3 rpm)
 # Watch it in another terminal:  ros2 topic echo /delivery_box/door_state
 set -euo pipefail
 STEP=${1:-8}

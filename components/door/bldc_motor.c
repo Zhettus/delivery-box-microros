@@ -34,9 +34,12 @@ static void set_brake(bool on)
 
 static void set_dir(int8_t dir)
 {
-    uint8_t open = s_cfg.pins.dir_level_open;
-    gpio_set_level(s_cfg.pins.dir_gpio, dir > 0 ? open : !open);
+    uint8_t open  = s_cfg.pins.dir_level_open;
+    int     level = dir > 0 ? open : !open;
+    gpio_set_level(s_cfg.pins.dir_gpio, level);
     s_dir_set = dir;
+    ESP_EARLY_LOGD(TAG, "DIR GPIO%d -> %d (%s)", s_cfg.pins.dir_gpio, level,
+                   dir > 0 ? "open" : "close");
 }
 
 esp_err_t bldc_motor_init(const bldc_motor_config_t *cfg)
@@ -58,6 +61,10 @@ esp_err_t bldc_motor_init(const bldc_motor_config_t *cfg)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     ESP_RETURN_ON_ERROR(gpio_config(&io), TAG, "DIR/BRAKE");
+    if (cfg->pins.dir_open_drain) {
+        ESP_RETURN_ON_ERROR(gpio_set_direction(cfg->pins.dir_gpio, GPIO_MODE_OUTPUT_OD),
+                            TAG, "DIR open-drain");
+    }
     set_brake(true);
     set_dir(+1);
 
@@ -76,10 +83,11 @@ esp_err_t bldc_motor_init(const bldc_motor_config_t *cfg)
     };
     ESP_RETURN_ON_ERROR(ledc_channel_config(&ch), TAG, "LEDC channel");
 
-    ESP_LOGI(TAG, "ready: PWM=GPIO%d @ %lu Hz%s, DIR=GPIO%d (open=%d), BRAKE=%s",
+    ESP_LOGI(TAG, "ready: PWM=GPIO%d @ %lu Hz%s, DIR=GPIO%d (open=%d%s), BRAKE=%s",
              cfg->pins.pwm_gpio, (unsigned long)cfg->freq_hz,
              cfg->pins.pwm_inverted ? " (inverted)" : "",
              cfg->pins.dir_gpio, cfg->pins.dir_level_open,
+             cfg->pins.dir_open_drain ? ", open-drain" : "",
              has_brake() ? "on" : "none");
     return ESP_OK;
 }

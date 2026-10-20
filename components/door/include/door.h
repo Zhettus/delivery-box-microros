@@ -60,6 +60,8 @@ typedef struct {
     uint8_t    dir_level_open;   /* DIR level (0/1) that turns the door OPEN      */
     uint8_t    brake_level_on;   /* BRAKE level (0/1) that brakes                 */
     bool       pwm_inverted;     /* true: motor runs faster with LESS high time   */
+    bool       dir_open_drain;   /* true: DIR "high" = let go of the wire, for a
+                                    motor that pulls DIR up to 5 V itself        */
 } door_bldc_config_t;
 
 /* Brushed motor + DFRobot DRI0042 + 2-channel Hall encoder. */
@@ -129,6 +131,32 @@ typedef struct {
     uint32_t hold_open_ms;               /* after reaching a not-closed position,
                                             close again after this (0 = never)   */
     float    auto_close_rpm;             /* speed of that automatic close        */
+    /* ---- Door-closed switch (optional) ------------------------------------
+     * With a switch, closing (a move TO 0) runs until the switch closes:
+     *   switch closes -> latch_lock_delay_ms later the latch solenoid
+     *   switches OFF (locks) -> the motor keeps closing until at least seat_ms
+     *   after the switch AND stop_after_latch_ms after the solenoid went off,
+     *   then stops.
+     *   Once the latch is locked and the shaft has stopped moving, that spot
+     *   becomes the new 0 (nothing adds up over cycles).
+     * close_overtravel_deg is how far past 0 it may go looking for the switch;
+     * if the switch never closes the move ends with DOOR_RESULT_NOT_CLOSED and
+     * the latch stays retracted. The latch only ever locks with the switch
+     * closed. GPIO_NUM_NC = no switch: closing simply goes to 0.            */
+    gpio_num_t closed_switch_gpio;
+    uint8_t    closed_switch_level;      /* input level when the door is closed  */
+    float      close_overtravel_deg;
+    uint32_t   seat_ms;
+    uint32_t   latch_lock_delay_ms;
+    uint32_t   stop_after_latch_ms;
+
+    /* ---- Nudge before opening (optional) ----------------------------------
+     * An open command while the door is closed first turns the shaft
+     * open_nudge_deg the CLOSING way, for at most open_nudge_ms, while the
+     * solenoid retracts the latch (the push takes the load off the bolt).
+     * Then the door opens. 0 = no nudge.                                    */
+    float      open_nudge_deg;
+    uint32_t   open_nudge_ms;
 
     /* ---- Latch solenoid (optional) --------------------------------------- */
     door_latch_config_t latch;
@@ -142,9 +170,15 @@ typedef struct {
 
 /*
  * One door move: turn by `degrees` from WHEREVER the door is now.
- * The start position is the move's ANCHOR. On resistance the door stops,
- * goes back to the anchor (counted in feedback pulses, not seconds), waits
- * `retry_wait_ms` and tries again, up to `max_retries` times.
+ * On resistance (motor current rise, or the door too slow) the door stops
+ * and goes back to the move's ANCHOR (counted in feedback pulses, not
+ * seconds): the start position, or `anchor_deg` if `anchor_set`. Then it
+ * waits `retry_wait_ms` and tries again, up to `max_retries` times; with no
+ * retries left it stays at the anchor, in that position's resting state
+ * (fault OBSTRUCTED, result RETURNED).
+ *
+ * Going back to closed (anchor 0) with a door switch ends like a normal
+ * close: it seats at the switch and the latch locks.
  */
 typedef struct {
     float                 degrees;       /* + = opening direction, - = closing;
@@ -153,7 +187,9 @@ typedef struct {
     float                 rpm;           /* output-shaft speed                    */
     float                 return_rpm;    /* speed back to the anchor (0 = rpm)    */
     door_current_limits_t current;       /* resistance limits for THIS move       */
-    uint8_t               max_retries;   /* 0 = go back once and give up          */
+    bool                  anchor_set;    /* true: on resistance go back to...     */
+    float                 anchor_deg;    /* ...this angle (e.g. 0 = closed)       */
+    uint8_t               max_retries;   /* 0 = go back once and stay there       */
     uint32_t              retry_wait_ms; /* wait at the anchor before retrying    */
     uint32_t              timeout_ms;    /* per attempt; 0 = automatic            */
 } door_move_t;
@@ -174,6 +210,7 @@ typedef struct {
     door_lock_state_t lock;              /* latch: locked / unlocking / ...      */
     float        solenoid;               /* latch solenoid power 0..1 (0 = locked) */
     uint32_t     auto_close_in_ms;       /* 0 = no automatic close pending       */
+    bool         closed_switch;          /* door-closed switch reads "closed"    */
 } door_status_t;
 
 /** Called from the door task whenever the state or fault changes. Keep it short.
@@ -191,7 +228,7 @@ void door_home(void);
 /**
  * Another sensor (e.g. the INA228 motor current) sees resistance right now.
  * Call it repeatedly while the condition lasts; the next control tick treats
- * it like any obstruction: back off to the previous position, wait, retry.
+ * it like any obstruction: go back to the move's anchor (see door_move_t).
  * Ignored while the door is not moving and during the spin-up grace period.
  */
 void door_report_obstruction(void);

@@ -55,6 +55,8 @@ static portMUX_TYPE        s_lock = portMUX_INITIALIZER_UNLOCKED;
 static door_fsm_cmd_t      s_pending;                   /* latest command wins */
 static bool                s_has_pending;
 static uint32_t            s_posted_seq;                /* last command posted    */
+static bool                s_pending_closing;           /* move to the closed position */
+#define SWITCH_DEBOUNCE_TICKS 3     /* same switch reading this many ticks (60 ms) */
 static uint32_t            s_done_seq;                  /* last command finished  */
 static EventGroupHandle_t  s_done;
 static door_current_limits_t s_limits;                  /* limits of the active move */
@@ -154,6 +156,32 @@ static esp_err_t latch_init(void)
     return pwm_util_channel_init(s_cfg.latch.channel, s_cfg.latch.timer, s_cfg.latch.gpio);
 }
 
+/* ---- door-closed switch ------------------------------------------------------- */
+
+static bool has_switch(void)
+{
+    return s_cfg.closed_switch_gpio != GPIO_NUM_NC;
+}
+
+static bool switch_reads_closed(void)
+{
+    return gpio_get_level(s_cfg.closed_switch_gpio) == s_cfg.closed_switch_level;
+}
+
+static esp_err_t switch_init(void)
+{
+    if (!has_switch()) {
+        return ESP_OK;
+    }
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << s_cfg.closed_switch_gpio,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = s_cfg.closed_switch_level == 0,   /* switch to GND */
+        .pull_down_en = s_cfg.closed_switch_level != 0,   /* switch to 3.3 V */
+    };
+    return gpio_config(&io);
+}
+
 /* Would this command turn the motor, starting at `pos`? */
 static bool cmd_moves(const door_fsm_cmd_t *c, int32_t pos)
 {
@@ -175,12 +203,14 @@ static uint32_t auto_timeout_ms(float travel_deg, float rpm)
 }
 
 /* Hand a command to the control task. Returns its sequence number. */
-static uint32_t post_cmd(const door_fsm_cmd_t *cmd, const door_current_limits_t *limits)
+static uint32_t post_cmd(const door_fsm_cmd_t *cmd, const door_current_limits_t *limits,
+                         bool closing)
 {
     xEventGroupClearBits(s_done, DONE_BIT);
     taskENTER_CRITICAL(&s_lock);
-    s_pending     = *cmd;
-    s_has_pending = true;
+    s_pending        = *cmd;
+    s_has_pending    = true;
+    s_pending_closing = closing;
     if (limits) {
         s_limits = *limits;
     }
@@ -192,7 +222,7 @@ static uint32_t post_cmd(const door_fsm_cmd_t *cmd, const door_current_limits_t 
 static void post(door_cmd_t type)
 {
     door_fsm_cmd_t c = door_fsm_cmd(type);
-    post_cmd(&c, type == DOOR_CMD_STOP ? NULL : &s_cfg.current);
+    post_cmd(&c, type == DOOR_CMD_STOP ? NULL : &s_cfg.current, false);
 }
 
 /* ---- motor current sensing (optional) ---------------------------------------- */
@@ -283,6 +313,23 @@ static void door_task(void *arg)
     int32_t zero = is_bldc() ? 0 : raw0;        /* power-up position = closed */
     int8_t  dir  = 0;
     uint32_t active_seq = 0;                 /* command the running move belongs to */
+    bool     active_closing = false;         /* running move goes to closed         */
+    bool     seating        = false;         /* switch closed: closing seat_ms more */
+    bool     seat_returned  = false;         /* ...on the way back from a blocked open */
+    uint32_t seat_since_ms  = 0;
+    float    seat_rpm       = 0.0f;
+    bool     latch_out      = false;         /* keep the solenoid off until LOCKED  */
+    uint32_t latch_out_since_ms = 0;
+    bool     lock_pending   = false;         /* switch closed: lock at lock_at_ms   */
+    bool     zero_pending   = false;         /* closed: zero once locked + still    */
+    uint32_t lock_at_ms     = 0;
+    bool     nudging        = false;         /* closing way a bit, before opening   */
+    uint32_t nudge_since_ms = 0;
+    int32_t  nudge_target   = 0;
+    float    nudge_rpm      = 0.0f;
+    door_fsm_cmd_t nudge_then = { 0 };       /* the open command, after the nudge   */
+    bool     sw_closed      = has_switch() && switch_reads_closed();
+    int      sw_same        = 0;
     bool     was_standstill = true;
 
     /* Latch: power-up = door closed = LOCKED. A command that would move the
@@ -337,17 +384,58 @@ static void door_task(void *arg)
         bool standstill = (abs_pos == win_pos[oldest]);  /* no count in the window */
         win_i = oldest;
 
+        if (has_switch()) {                              /* debounced door switch */
+            bool raw = switch_reads_closed();
+            sw_same = (raw == sw_closed) ? 0 : sw_same + 1;
+            if (sw_same >= SWITCH_DEBOUNCE_TICKS) {
+                sw_closed = raw;
+                sw_same   = 0;
+            }
+        }
+
         /* ---- decide ---------------------------------------------------- */
         taskENTER_CRITICAL(&s_lock);
         door_fsm_cmd_t cmd = s_pending;
         bool has_cmd = s_has_pending;
         s_has_pending = false;
         uint32_t cmd_seq = s_posted_seq;
+        bool cmd_closing = s_pending_closing;
         bool ext_obstruction = s_ext_obstruction;
         s_ext_obstruction = false;
         taskEXIT_CRITICAL(&s_lock);
         if (has_cmd) {
-            active_seq = cmd_seq;
+            active_seq    = cmd_seq;
+            active_closing = cmd_closing;
+        }
+
+        /* Closed but not zeroed yet and a new command arrives: zero now, so
+         * the command's angles count from the closed position. */
+        if (has_cmd && zero_pending) {
+            zero_pending = false;
+            zero = abs_pos;
+            pos  = 0;
+        }
+
+        /* ---- opening from closed: nudge the closing way first --------------
+         * The solenoid retracts the latch WHILE the motor nudges the closing
+         * way (that takes the load off the latch bolt). Afterwards the open
+         * command waits in `deferred` until the latch is retracted, like any
+         * move (see door.h). */
+        if (has_cmd) {
+            seating = false;                       /* a new command ends seating */
+            nudging = false;                       /* ...and a nudge             */
+        }
+        bool door_closed = has_switch() ? sw_closed : labs(pos) <= s_fsm_cfg.tolerance;
+        if (has_cmd && s_cfg.open_nudge_deg > 0.0f && door_closed &&
+            cmd.type == DOOR_CMD_MOVE && cmd.absolute && cmd.delta > pos + s_fsm_cfg.tolerance) {
+            nudging        = true;
+            nudge_then     = cmd;
+            nudge_since_ms = now_ms;
+            nudge_target   = pos - (int32_t)lroundf(s_cfg.open_nudge_deg * s_counts_per_deg);
+            nudge_rpm      = cmd.rpm > 0.0f ? cmd.rpm : s_fsm_cfg.approach_rpm;
+            has_cmd        = false;
+            has_deferred   = false;
+            close_pending  = false;
         }
 
         /* ---- latch: retract it before anything moves --------------------- */
@@ -394,15 +482,110 @@ static void door_task(void *arg)
             sensor_abort = true;
         }
 
-        door_fsm_output_t o = door_fsm_step(&fsm, &s_fsm_cfg, has_cmd ? &cmd : NULL,
-                                            now_ms, pos, out_rpm, ext_obstruction);
-        if (sensor_abort) {
-            fsm.result = DOOR_RESULT_SENSOR_FAIL;
+        if (has_cmd || sensor_abort) {
+            seating = false;                       /* a new command ends seating */
+            nudging = false;                       /* ...and a nudge             */
         }
+
+        door_fsm_output_t o;
+        if (nudging) {
+            /* Closing way until nudge_target (or open_nudge_ms if the door is
+             * already against its stop), solenoid pulling meanwhile. Then stop
+             * and hand the open command on: it opens once the latch is out. */
+            o = (door_fsm_output_t){ .target_rpm = -nudge_rpm };
+            if (pos <= nudge_target ||
+                (uint32_t)(now_ms - nudge_since_ms) >= s_cfg.open_nudge_ms) {
+                nudging      = false;
+                deferred     = nudge_then;
+                has_deferred = true;
+                o.target_rpm = 0.0f;
+            }
+        } else if (seating) {
+            /* The switch closed: keep closing at least seat_ms so the door
+             * seats firmly, and until the solenoid has been off for
+             * stop_after_latch_ms (the motor never stops before the latch is
+             * out). If the lock was cancelled (switch opened again), stop
+             * after seat_ms. */
+            o = (door_fsm_output_t){ .target_rpm = -seat_rpm };
+            bool seat_done  = (uint32_t)(now_ms - seat_since_ms) >= s_cfg.seat_ms;
+            bool latch_done = !has_latch() || (!lock_pending && !latch_out) ||
+                              (latch_out && (uint32_t)(now_ms - latch_out_since_ms) >=
+                                            s_cfg.stop_after_latch_ms);
+            if (seat_done && latch_done) {
+                seating         = false;
+                fsm.state       = DOOR_STATE_CLOSED;
+                fsm.goal_state  = DOOR_STATE_CLOSED;
+                fsm.goal_pos    = 0;
+                fsm.fault       = seat_returned ? DOOR_FAULT_OBSTRUCTED : DOOR_FAULT_NONE;
+                fsm.retries     = 0;
+                fsm.result      = seat_returned ? DOOR_RESULT_RETURNED : DOOR_RESULT_DONE;
+                o.target_rpm    = 0.0f;
+                o.finished      = true;
+                o.state_changed = true;
+                zero_pending    = true;            /* zero once locked and still */
+            }
+        } else {
+            o = door_fsm_step(&fsm, &s_fsm_cfg, has_cmd ? &cmd : NULL,
+                              now_ms, pos, out_rpm, ext_obstruction);
+            if (sensor_abort) {
+                fsm.result = DOOR_RESULT_SENSOR_FAIL;
+            }
+
+            /* Resistance while opening, no retries left: going back to
+             * closed for good. With a switch it ends like a normal close. */
+            bool returning_closed = has_switch() && fsm.state == DOOR_STATE_BACKING_OFF &&
+                                    fsm.move_target == 0 && fsm.retries >= fsm.mv_retries;
+            if (returning_closed && sw_closed) {
+                active_closing = false;
+                seating        = true;
+                seat_returned  = true;
+                lock_pending   = true;
+                lock_at_ms     = now_ms + s_cfg.latch_lock_delay_ms;
+                seat_since_ms  = now_ms;
+                seat_rpm       = fsm.mv_return_rpm > 0.0f ? fsm.mv_return_rpm
+                               : fsm.mv_rpm > 0.0f        ? fsm.mv_rpm
+                                                          : s_fsm_cfg.approach_rpm;
+                o.target_rpm   = -seat_rpm;
+                o.finished     = false;
+            } else if (o.finished && has_switch() && !sw_closed &&
+                       fsm.result == DOOR_RESULT_RETURNED && fsm.state == DOOR_STATE_CLOSED) {
+                /* Back at closed by the count, but the switch never closed. */
+                fsm.state       = DOOR_STATE_FAULT;
+                fsm.fault       = DOOR_FAULT_NOT_CLOSED;
+                fsm.result      = DOOR_RESULT_NOT_CLOSED;
+                o.state_changed = true;
+            }
+
+            if (active_closing) {
+                if (sw_closed && fsm.state == DOOR_STATE_CLOSING) {
+                    /* Door reached the switch: seat, stop; latch later. */
+                    active_closing = false;
+                    seating        = true;
+                    seat_returned  = false;
+                    lock_pending   = true;
+                    lock_at_ms     = now_ms + s_cfg.latch_lock_delay_ms;
+                    seat_since_ms  = now_ms;
+                    seat_rpm       = fsm.mv_rpm > 0.0f ? fsm.mv_rpm : s_fsm_cfg.approach_rpm;
+                    o.target_rpm   = -seat_rpm;
+                    o.finished     = false;
+                } else if (o.finished) {
+                    active_closing = false;
+                    if (fsm.result == DOOR_RESULT_DONE) {
+                        /* Went the whole way and the switch never closed. */
+                        fsm.state       = DOOR_STATE_FAULT;
+                        fsm.fault       = DOOR_FAULT_NOT_CLOSED;
+                        fsm.result      = DOOR_RESULT_NOT_CLOSED;
+                        o.state_changed = true;
+                    }
+                }
+            }
+        }
+
         if (o.zero_position) {
             zero = abs_pos;
             pos  = 0;
         }
+
 
         if (o.finished && s_cfg.hold_open_ms > 0 && fsm.result == DOOR_RESULT_DONE &&
             labs(pos) > s_fsm_cfg.tolerance) {
@@ -411,16 +594,46 @@ static void door_task(void *arg)
         }
 
         /* ---- latch ----------------------------------------------------- */
-        bool busy = (fsm.result == DOOR_RESULT_BUSY);
+        bool busy = (fsm.result == DOOR_RESULT_BUSY) || nudging;
         door_lock_output_t lk = { .motion_allowed = true };
         if (has_latch()) {
-            bool closed_rest = !busy && labs(pos) <= s_fsm_cfg.tolerance &&
+            bool at_closed   = has_switch() ? sw_closed : labs(pos) <= s_fsm_cfg.tolerance;
+            if (has_cmd || s_latch_hold || !sw_closed) {
+                lock_pending = false;              /* a new move / door opened again */
+            }
+            if (lock_pending && (int32_t)(now_ms - lock_at_ms) >= 0) {
+                lock_pending       = false;
+                latch_out          = true;         /* switch closed long enough: lock */
+                latch_out_since_ms = now_ms;
+            }
+            bool closed_rest = !busy && at_closed && !lock_pending &&
                                dir == 0 && was_standstill && standstill;
+            bool wants_motion = busy || has_deferred || s_latch_hold;
             lk = door_lock_step(&latch, &s_cfg.latch.timing, now_ms,
-                                busy || has_deferred || s_latch_hold, closed_rest);
+                                wants_motion, closed_rest);
+            if (nudging) {
+                lk.motion_allowed = true;          /* closing way: may move while the
+                                                      latch is still retracting */
+            }
+            if (has_cmd || s_latch_hold || latch.state == DOOR_LOCK_LOCKED) {
+                latch_out = false;
+            }
+            if (latch_out) {
+                lk.solenoid = 0.0f;                /* delay over: latch out until LOCKED */
+            }
             latch_write(lk.solenoid);
         }
         was_standstill = standstill;
+
+        /* Closed: zero the angle once the latch is locked and the shaft has
+         * stopped moving (no pulses in the speed window). */
+        if (zero_pending && dir == 0 && standstill &&
+            (!has_latch() || latch.state == DOOR_LOCK_LOCKED)) {
+            zero_pending    = false;
+            zero            = abs_pos;
+            pos             = 0;
+            o.zero_position = true;                /* logged as "closed position set" */
+        }
 
         /* ---- act ------------------------------------------------------- */
         int8_t wanted = (o.target_rpm > 0.0f) - (o.target_rpm < 0.0f);
@@ -458,6 +671,7 @@ static void door_task(void *arg)
             .solenoid     = lk.solenoid,
             .auto_close_in_ms = !close_pending ? 0
                               : (int32_t)(close_at_ms - now_ms) > 0 ? close_at_ms - now_ms : 1,
+            .closed_switch = sw_closed,
         };
         if (o.finished) {
             s_done_seq = active_seq;
@@ -534,6 +748,7 @@ esp_err_t door_init(const door_config_t *cfg)
      * door locked as early as possible. */
     ESP_RETURN_ON_ERROR(motor_init(), TAG, "motor");
     ESP_RETURN_ON_ERROR(latch_init(), TAG, "latch");
+    ESP_RETURN_ON_ERROR(switch_init(), TAG, "door switch");
     if (s_cfg.auto_close_rpm <= 0.0f) {
         s_cfg.auto_close_rpm = cfg->cruise_rpm;
     }
@@ -677,25 +892,39 @@ esp_err_t door_rotate_start(const door_move_t *m)
     ESP_RETURN_ON_FALSE(s_done != NULL, ESP_ERR_INVALID_STATE, TAG, "door_init first");
     ESP_RETURN_ON_FALSE(m && m->rpm > 0.0f, ESP_ERR_INVALID_ARG, TAG, "rpm must be > 0");
 
+    /* Going TO closed (0) with a door switch: aim close_overtravel_deg past
+     * 0; the door task ends the move at the switch (see door.h). Switch
+     * already closed: nothing to do. */
+    float degrees = m->degrees;
+    door_status_t now = door_get_status();
+    bool  at_closed = now.result != DOOR_RESULT_BUSY &&
+                      (has_switch() ? now.closed_switch
+                                    : fabsf(now.position_deg) <= s_cfg.tolerance_deg);
+    bool  closing = m->absolute && m->degrees == 0.0f && has_switch() && !at_closed;
+    if (closing) {
+        degrees = -fabsf(s_cfg.close_overtravel_deg);
+    }
+
     uint32_t timeout = m->timeout_ms;
     if (timeout == 0) {                       /* automatic: 2 x travel time + 3 s */
         float slowest = (m->return_rpm > 0.0f && m->return_rpm < m->rpm) ? m->return_rpm
                                                                           : m->rpm;
-        float travel  = m->absolute ? m->degrees - door_get_status().position_deg
-                                    : m->degrees;
+        float travel  = m->absolute ? degrees - now.position_deg : degrees;
         timeout = auto_timeout_ms(travel, slowest);
     }
     door_fsm_cmd_t c = {
         .type          = DOOR_CMD_MOVE,
-        .delta         = (int32_t)lroundf(m->degrees * s_counts_per_deg),
+        .delta         = (int32_t)lroundf(degrees * s_counts_per_deg),
         .absolute      = m->absolute,
         .rpm           = m->rpm,
         .return_rpm    = m->return_rpm,
         .max_retries   = m->max_retries,
         .retry_wait_ms = m->retry_wait_ms,
         .timeout_ms    = timeout,
+        .has_anchor    = m->anchor_set,
+        .anchor        = (int32_t)lroundf(m->anchor_deg * s_counts_per_deg),
     };
-    post_cmd(&c, &m->current);
+    post_cmd(&c, &m->current, closing);
     return ESP_OK;
 }
 

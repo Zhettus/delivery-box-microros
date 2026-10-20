@@ -1,0 +1,4 @@
+dependencies:
+  idf: ">=5.2"
+  # Same RMT LED driver version both original projects were tested with.
+  espressif/led_strip: "~2.5.5"
