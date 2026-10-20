@@ -43,7 +43,7 @@
  * straight to the supply (through the INA228); the ESP32 only talks to the
  * control wires.                                                            */
 #define PIN_MOTOR_PWM       GPIO_NUM_18   /* motor speed input (PWM)          */
-#define PIN_MOTOR_DIR       GPIO_NUM_21   /* motor direction input (CW/CCW)   */
+#define PIN_MOTOR_DIR       GPIO_NUM_47   /* motor direction input (CW/CCW)   */
 #define PIN_MOTOR_BRAKE     GPIO_NUM_40   /* motor brake input (HIGH = brake) */
 /* PWM and BRAKE are the other way round from the esp32s3 project's wiring
  * doc (PWM 40, BRAKE 18). Measured on the box on 2026-10-01: GPIO18 duty

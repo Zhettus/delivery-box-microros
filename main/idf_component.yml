@@ -1,4 +1,5 @@
 dependencies:
-  idf: ">=5.2"
+  idf: '>=5.2'
   # Same RMT LED driver version both original projects were tested with.
-  espressif/led_strip: "~2.5.5"
+  espressif/led_strip: ~2.5.5
+  micro-ros/micro_ros_espidf_component: ^24
